@@ -139,6 +139,44 @@ then filtering the results in-memory. For example, for the following command;
 first a `ListObjects` request is send, then the copy operation will be executed
 against each matching object, in parallel.
 
+### RDMA runtime
+
+RDMA builds require Go 1.21+ because the RDMA implementation uses
+`runtime.Pinner` for Go buffer pinning.
+
+The RDMA shim targets the cuObjClient 1.3 API. Build with `make build-rdma`
+against matching `cuobjclient.h` and `libcuobjclient` versions. When the header
+defines `CUOBJ_CLIENT_MAJOR_VERSION` and `CUOBJ_CLIENT_MINOR_VERSION`, the
+build rejects versions older than 1.3. Newer major versions can build if they
+still provide the API used here. Older headers without these macros still
+build, but their compatibility cannot be checked automatically.
+
+Enable RDMA per process:
+
+```sh
+export S5CMD_USE_RDMA=1
+```
+
+Make the CUDA libraries visible to the dynamic linker if they are not installed
+in a standard linker path:
+
+```sh
+export LD_LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib:$LD_LIBRARY_PATH
+```
+
+Point cuFile/GDS to a non-default config file when needed:
+
+```sh
+export CUFILE_ENV_PATH_JSON=/path/to/cufile.json
+```
+
+Then run `s5cmd` normally:
+
+```sh
+S5CMD_USE_RDMA=1 ./s5cmd --endpoint-url https://example-object-endpoint cp file.bin s3://bucket/file.bin
+```
+
+For more details, see [RDMA Spec](./rdma/rdma_spec.md).
 
 ### Specifying credentials
 
@@ -786,4 +824,5 @@ significant runtime difference between those two approaches.
 
 # LICENSE
 
-MIT. See [LICENSE](https://github.com/peak/s5cmd/blob/master/LICENSE).
+This project is based on the original [S5cmd source](https://github.com/peak/s5cmd)
+by Peak. It is licensed under MIT; see this repository's [LICENSE](./LICENSE).

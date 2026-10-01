@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
+	"github.com/peak/s5cmd/v2/rdma"
 )
 
 // MaxUploadParts is the maximum allowed number of parts in a multi-part upload
@@ -32,6 +33,8 @@ const DefaultUploadPartSize = MinUploadPartSize
 // DefaultUploadConcurrency is the default number of goroutines to spin up when
 // using Upload().
 const DefaultUploadConcurrency = 5
+
+const contentMD5Header = "Content-Md5"
 
 // A MultiUploadFailure wraps a failed S3 multipart upload. An error returned
 // will satisfy this interface when a multi part upload failed to upload all
@@ -532,8 +535,21 @@ func (u *uploader) singlePart(r io.ReadSeeker, cleanup func()) (*UploadOutput, e
 	awsutil.Copy(params, u.in)
 	params.Body = r
 
-	// Need to use request form because URL generated in request is
-	// used in return.
+	// s5cmd patch: dispatch to the RDMA path when RDMA is requested. The hook is
+	// in the vendored SDK because the RDMA path still needs the SDK's request
+	// lifecycle (signing, retries, error handling).
+	if rdma.Enabled() {
+		return u.singlePartRDMA(params, r)
+	}
+
+	return u.sendSinglePart(params)
+}
+
+// sendSinglePart is the original, unmodified singlePart body, split out so the
+// normal path and the RDMA fallback share it.
+//
+// Need to use request form because URL generated in request is used in return.
+func (u *uploader) sendSinglePart(params *s3.PutObjectInput) (*UploadOutput, error) {
 	req, out := u.cfg.S3.PutObjectRequest(params)
 	req.SetContext(u.ctx)
 	req.ApplyOptions(u.cfg.RequestOptions...)
@@ -541,12 +557,72 @@ func (u *uploader) singlePart(r io.ReadSeeker, cleanup func()) (*UploadOutput, e
 		return nil, err
 	}
 
-	url := req.HTTPRequest.URL.String()
 	return &UploadOutput{
-		Location:  url,
+		Location:  req.HTTPRequest.URL.String(),
 		VersionID: out.VersionId,
 		ETag:      out.ETag,
 	}, nil
+}
+
+// singlePartRDMA uploads a whole object in one request by registering its
+// payload in an RDMA buffer and sending a bodyless PUT carrying the resulting
+// token; the server pulls the bytes from the buffer.
+func (u *uploader) singlePartRDMA(params *s3.PutObjectInput, bodyReader io.Reader) (*UploadOutput, error) {
+	// The payload must be fully in memory to be registered, so buffer it before
+	// building the request.
+	body, err := rdma.ReadAll(bodyReader)
+	if err != nil {
+		return nil, err
+	}
+	// An empty object has nothing to register; use the normal path.
+	if len(body) == 0 {
+		params.Body = bytes.NewReader(body)
+		return u.sendSinglePart(params)
+	}
+
+	// Send with no body: the payload travels over RDMA, not HTTP.
+	params.Body = nil
+	req, out := u.cfg.S3.PutObjectRequest(params)
+	req.SetContext(u.ctx)
+	req.ApplyOptions(u.cfg.RequestOptions...)
+
+	// MD5 is computed concurrently with RDMA client setup and token mint: the
+	// two are independent and both non-trivial for large payloads, so
+	// overlapping them keeps the hash off the critical path.
+	computeMD5 := !aws.BoolValue(req.Config.S3DisableContentMD5Validation)
+	transfer, md5Value, err := rdma.PreparePutWithMD5(body, computeMD5)
+	if err != nil {
+		return nil, err
+	}
+	defer transfer.Close()
+
+	setRDMAPutHeaders(req, transfer.Token())
+	// With no HTTP body the SDK cannot compute the checksum itself, so set it
+	// from the buffered payload to keep integrity validation working.
+	if computeMD5 {
+		req.HTTPRequest.Header.Set(contentMD5Header, md5Value)
+	}
+
+	if err := req.Send(); err != nil {
+		return nil, err
+	}
+	// The endpoint declined RDMA; restore the body and resend over TCP.
+	if rdma.ShouldFallbackHeader(req.HTTPResponse.Header) {
+		params.Body = bytes.NewReader(body)
+		return u.sendSinglePart(params)
+	}
+
+	return &UploadOutput{
+		Location:  req.HTTPRequest.URL.String(),
+		VersionID: out.VersionId,
+		ETag:      out.ETag,
+	}, nil
+}
+
+// setRDMAPutHeaders attaches the token that tells the endpoint where to read
+// from, and zeroes Content-Length because the request carries no body.
+func setRDMAPutHeaders(req *request.Request, token string) {
+	req.ApplyOptions(request.WithSetRequestHeaders(rdma.PutHeaders(token)))
 }
 
 // internal structure to manage a specific multipart upload to S3.

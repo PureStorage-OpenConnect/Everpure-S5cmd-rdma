@@ -11,6 +11,7 @@ import (
 	"github.com/peak/s5cmd/v2/log"
 	"github.com/peak/s5cmd/v2/log/stat"
 	"github.com/peak/s5cmd/v2/parallel"
+	"github.com/peak/s5cmd/v2/rdma"
 	"github.com/peak/s5cmd/v2/storage"
 )
 
@@ -228,5 +229,9 @@ func AppCommand(name string) *cli.Command {
 func Main(ctx context.Context, args []string) error {
 	app.Commands = Commands()
 
-	return app.RunContext(ctx, args)
+	err := app.RunContext(ctx, args)
+	if closeErr := rdma.CloseShared(); closeErr != nil && err == nil {
+		err = closeErr
+	}
+	return err
 }
