@@ -22,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go/private/protocol/eventstream/eventstreamapi"
 	"github.com/aws/aws-sdk-go/private/protocol/rest"
 	"github.com/aws/aws-sdk-go/private/protocol/restxml"
+	"github.com/peak/s5cmd/v2/rdma"
 )
 
 const opAbortMultipartUpload = "AbortMultipartUpload"
@@ -4766,11 +4767,78 @@ func (c *S3) GetObject(input *GetObjectInput) (*GetObjectOutput, error) {
 // the context is nil a panic will occur. In the future the SDK may create
 // sub-contexts for http.Requests. See https://golang.org/pkg/context/
 // for more information on using Contexts.
+//
+// s5cmd patch: when RDMA is requested this dispatches to the RDMA path. The
+// hook lives in the vendored SDK because s5cmd's higher layers use the SDK's
+// own request lifecycle (signing, retries, error handling), which cannot be
+// reproduced from outside without reimplementing it.
 func (c *S3) GetObjectWithContext(ctx aws.Context, input *GetObjectInput, opts ...request.Option) (*GetObjectOutput, error) {
+	if rdma.Enabled() {
+		return c.getObjectWithRDMA(ctx, input, opts...)
+	}
+
+	return c.sendGetObject(ctx, input, opts...)
+}
+
+// sendGetObject is the original, unmodified GetObjectWithContext body. It is
+// split out so both the normal path and the RDMA fallback can reach it.
+func (c *S3) sendGetObject(ctx aws.Context, input *GetObjectInput, opts ...request.Option) (*GetObjectOutput, error) {
 	req, out := c.GetObjectRequest(input)
 	req.SetContext(ctx)
 	req.ApplyOptions(opts...)
 	return out, req.Send()
+}
+
+// getObjectWithRDMA performs a ranged GET whose payload is written by the
+// server straight into a locally registered RDMA buffer. The HTTP response
+// carries no body; the data lands in the buffer, which is then handed to the
+// caller as out.Body.
+func (c *S3) getObjectWithRDMA(ctx aws.Context, input *GetObjectInput, opts ...request.Option) (*GetObjectOutput, error) {
+	// The buffer must be registered before the request is sent, so the exact
+	// transfer length has to be known up front. s5cmd's download manager always
+	// issues bounded ranges; anything else is a caller bug.
+	size, err := rdma.ParseBoundedRangeSize(aws.StringValue(input.Range))
+	if err != nil {
+		return nil, fmt.Errorf("RDMA GET requires a bounded Range header: %w", err)
+	}
+
+	transfer, err := rdma.PrepareGet(size)
+	if err != nil {
+		return nil, err
+	}
+	defer transfer.Close()
+
+	req, out := c.GetObjectRequest(input)
+	req.SetContext(ctx)
+	req.ApplyOptions(opts...)
+	setRDMAGetHeaders(req, transfer.Token())
+
+	if err := req.Send(); err != nil {
+		return out, err
+	}
+	// The endpoint declined RDMA for this GET and already returned the payload
+	// in the HTTP response body
+	if rdma.ShouldFallbackHeader(req.HTTPResponse.Header) {
+		return out, nil
+	}
+
+	// Trust the server's transferred count over the requested range: a read
+	// near end-of-object returns fewer bytes than the range asked for.
+	if transferred, err := rdma.RequiredBytesTransferred(req.HTTPResponse.Header); err != nil {
+		return out, err
+	} else {
+		size = transferred
+	}
+	// Ownership of the buffer moves to the body, so the deferred Close above
+	// releases only the cuObject client and not the data the caller will read.
+	body, err := transfer.ReleaseReader(size)
+	if err != nil {
+		return out, err
+	}
+	out.Body = body
+	out.ContentLength = aws.Int64(int64(size))
+
+	return out, nil
 }
 
 const opGetObjectAcl = "GetObjectAcl"
@@ -11037,11 +11105,92 @@ func (c *S3) UploadPart(input *UploadPartInput) (*UploadPartOutput, error) {
 // the context is nil a panic will occur. In the future the SDK may create
 // sub-contexts for http.Requests. See https://golang.org/pkg/context/
 // for more information on using Contexts.
+//
+// s5cmd patch: dispatches to the RDMA path when RDMA is requested. See the note
+// on GetObjectWithContext for why this hook is in the vendored SDK.
 func (c *S3) UploadPartWithContext(ctx aws.Context, input *UploadPartInput, opts ...request.Option) (*UploadPartOutput, error) {
+	if rdma.Enabled() {
+		return c.uploadPartWithRDMA(ctx, input, opts...)
+	}
+
+	return c.sendUploadPart(ctx, input, opts...)
+}
+
+// sendUploadPart is the original, unmodified UploadPartWithContext body, split
+// out so the normal path and the RDMA fallback share it.
+func (c *S3) sendUploadPart(ctx aws.Context, input *UploadPartInput, opts ...request.Option) (*UploadPartOutput, error) {
 	req, out := c.UploadPartRequest(input)
 	req.SetContext(ctx)
 	req.ApplyOptions(opts...)
 	return out, req.Send()
+}
+
+// uploadPartWithRDMA uploads one multipart part by registering its payload in
+// an RDMA buffer and sending a bodyless request carrying the resulting token;
+// the server pulls the bytes from the buffer.
+func (c *S3) uploadPartWithRDMA(ctx aws.Context, input *UploadPartInput, opts ...request.Option) (*UploadPartOutput, error) {
+	// The payload must be fully in memory to be registered, so the body is
+	// buffered before the request is built.
+	body, err := rdma.ReadAll(input.Body)
+	if err != nil {
+		return nil, err
+	}
+	// An empty part has nothing to register; use the normal path.
+	if len(body) == 0 {
+		return c.sendUploadPart(ctx, cloneUploadPartInput(input, bytes.NewReader(body)), opts...)
+	}
+
+	// Send with a nil body: the payload travels over RDMA, not HTTP.
+	req, out := c.UploadPartRequest(cloneUploadPartInput(input, nil))
+	req.SetContext(ctx)
+	req.ApplyOptions(opts...)
+
+	// MD5 is computed concurrently with RDMA client setup and token mint: the
+	// two are independent and both non-trivial for large parts, so overlapping
+	// them keeps the hash off the critical path.
+	computeMD5 := !aws.BoolValue(req.Config.S3DisableContentMD5Validation)
+	transfer, md5Value, err := rdma.PreparePutWithMD5(body, computeMD5)
+	if err != nil {
+		return nil, err
+	}
+	defer transfer.Close()
+
+	setRDMAPutHeaders(req, transfer.Token())
+	// With no HTTP body the SDK cannot compute the checksum itself, so set it
+	// from the buffered payload to keep integrity validation working.
+	if computeMD5 {
+		req.HTTPRequest.Header.Set(contentMD5Header, md5Value)
+	}
+
+	if err := req.Send(); err != nil {
+		return nil, err
+	}
+	// The endpoint declined RDMA for this part; resend it over TCP.
+	if rdma.ShouldFallbackHeader(req.HTTPResponse.Header) {
+		return c.sendUploadPart(ctx, cloneUploadPartInput(input, bytes.NewReader(body)), opts...)
+	}
+
+	return out, nil
+}
+
+// cloneUploadPartInput copies the input with a different body, so swapping in a
+// nil or rewound body never mutates the caller's struct — the fallback path
+// depends on the original staying intact.
+func cloneUploadPartInput(input *UploadPartInput, body io.ReadSeeker) *UploadPartInput {
+	cloned := *input
+	cloned.Body = body
+	return &cloned
+}
+
+// setRDMAGetHeaders attaches the token that tells the endpoint where to write.
+func setRDMAGetHeaders(req *request.Request, token string) {
+	req.ApplyOptions(request.WithSetRequestHeaders(rdma.GetHeaders(token)))
+}
+
+// setRDMAPutHeaders attaches the token that tells the endpoint where to read
+// from, and zeroes Content-Length because the request carries no body.
+func setRDMAPutHeaders(req *request.Request, token string) {
+	req.ApplyOptions(request.WithSetRequestHeaders(rdma.PutHeaders(token)))
 }
 
 const opUploadPartCopy = "UploadPartCopy"
